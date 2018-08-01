@@ -5,27 +5,30 @@ import {
   Component,
   ElementRef,
   EventEmitter,
-  forwardRef,
   Input,
   OnChanges,
   OnDestroy,
-  OnInit,
+  OnInit, Optional,
   Output,
   Renderer2,
+  Self,
   ViewChild,
   ViewEncapsulation
 } from '@angular/core';
 import {
   ControlValueAccessor,
-  NG_VALUE_ACCESSOR,
   FormGroup,
-  FormControl
+  NG_VALIDATORS,
+  NgControl,
+  ValidationErrors,
+  ValidatorFn,
+  Validators
 } from '@angular/forms';
 
-import { TimepickerActions } from './reducer/timepicker.actions';
-import { TimepickerStore } from './reducer/timepicker.store';
 import { getControlsValue } from './timepicker-controls.util';
+import { TimepickerActions } from './reducer/timepicker.actions';
 import { TimepickerConfig } from './timepicker.config';
+import { TimepickerStore } from './reducer/timepicker.store';
 import {
   TimeChangeSource,
   TimepickerComponentState,
@@ -38,24 +41,49 @@ import {
   parseTime
 } from './timepicker.utils';
 import {
-  getHoursValidator,
-  getLimitsValidator,
-  getMinutesValidator,
-  getSecondsValidator
+  hoursValidator,
+  limitsValidator,
+  minutesValidator,
+  secondsValidator
 } from './input.validator';
+
+import { distinctUntilChanged, filter, map } from 'rxjs/operators';
 import { Subscription } from 'rxjs';
 
-export const TIMEPICKER_CONTROL_VALUE_ACCESSOR: any = {
-  provide: NG_VALUE_ACCESSOR,
-  useExisting: forwardRef(() => TimepickerComponent),
+export function validate(control: any): ValidationErrors | null {
+  if (!control.value) {
+
+    return null;
+  }
+
+  const timeValidator: ValidatorFn = _getTimeValidatorByName(control.value.timeOptionName);
+
+  return Validators.compose([
+    timeValidator,
+    limitsValidator
+  ])(control);
+}
+
+function _getTimeValidatorByName(name: string): ValidatorFn | null {
+  const validator: { [name: string]: ValidatorFn } = {
+    hours: hoursValidator,
+    minutes: minutesValidator,
+    seconds: secondsValidator
+  };
+
+  return validator[name] ? validator[name] : null;
+}
+
+export const TIMEPICKER_VALIDATORS: any = {
+  provide: NG_VALIDATORS,
+  useValue: validate,
   multi: true
 };
-
 
 @Component({
   selector: 'timepicker',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  providers: [TIMEPICKER_CONTROL_VALUE_ACCESSOR, TimepickerStore],
+  providers: [TIMEPICKER_VALIDATORS, TimepickerStore],
   templateUrl: './timepicker.component.html',
   styleUrls: ['./timepicker.component.scss'],
   encapsulation: ViewEncapsulation.None
@@ -110,8 +138,6 @@ export class TimepickerComponent
   seconds: string;
   meridian: string;
 
-  timepickerGroup: FormGroup;
-
   /** @deprecated - please use `isEditable` instead */
   get isSpinnersVisible(): boolean {
     return this.showSpinners && !this.readonlyInput;
@@ -132,70 +158,70 @@ export class TimepickerComponent
 
   canToggleMeridian: boolean;
 
-  // control value accessor methods
-  onChange: any = Function.prototype;
-  onTouched: any = Function.prototype;
-
   timepickerSub: Subscription;
+
+  // control value accessor methods
+  private _onChange: any = Function.prototype;
+  private _onTouched: any = Function.prototype;
 
 
   constructor(
+    @Self() @Optional() public ngControl: NgControl,
     _config: TimepickerConfig,
-    private _cd: ChangeDetectorRef,
+    changeDetection: ChangeDetectorRef,
     private _renderer: Renderer2,
     private _store: TimepickerStore,
     private _timepickerActions: TimepickerActions
   ) {
     Object.assign(this, _config);
 
-    this.timepickerSub = _store
+    if (this.ngControl) {
+      // we provide the value accessor through here, instead of
+      // the `providers` to avoid running into a circular import.
+      this.ngControl.valueAccessor = this;
+    }
+
+    this.timepickerSub = this._store
       .select(state => state.value)
       .subscribe((value: Date) => {
         // update UI values if date changed
         this._renderTime(value);
-        this.onChange(value);
+        this._onChange(value);
 
         this._store.dispatch(
           this._timepickerActions.updateControls(getControlsValue(this))
         );
       });
 
-    _store
+    this._store
       .select(state => state.controls)
       .subscribe((controlsState: TimepickerControls) => {
         this.isValid.emit(isInputValid(this.hours, this.minutes, this.seconds));
         Object.assign(this, controlsState);
-        _cd.markForCheck();
+        changeDetection.markForCheck();
       });
   }
 
   ngOnInit(): void {
-    this.timepickerGroup = new FormGroup(
-      {
-        hours: new FormControl(0, { validators: [getHoursValidator()], updateOn: 'blur' }),
-        minutes: new FormControl(0, { validators: [getMinutesValidator()], updateOn: 'blur' }),
-        seconds: new FormControl(0, { validators: [getSecondsValidator()], updateOn: 'blur' })
-      },
-      getLimitsValidator(this.min, this.max)
-    );
-
-    this.timepickerGroup.valueChanges
-      .subscribe(() => {
-        if (this.timepickerGroup.invalid) {
-          this.onChange(null);
-          this.isValid.emit(false);
-
-          return;
-        }
-
-        this.isValid.emit(true);
+    this.ngControl.valueChanges
+      .pipe(
+        filter(() => Boolean(!this.ngControl.errors)),
+        filter((value: any) => value && value.timeOptionName)
+      )
+      .subscribe(({ timeOptionName, timeOptionValue }: any) => {
+        this.updateTimeOption(timeOptionName, timeOptionValue);
       });
-  }
 
-  resetValidation(): void {
-    this.timepickerGroup.get('hours').setErrors(null);
-    this.timepickerGroup.get('minutes').setErrors(null);
-    this.timepickerGroup.get('seconds').setErrors(null);
+    this.ngControl.statusChanges
+      .pipe(
+        map(() => this.ngControl.errors),
+        filter(Boolean),
+        distinctUntilChanged()
+      )
+      .subscribe((errors: ValidationErrors | null) => {
+        this._onChange(null);
+        this.ngControl.control.setErrors(errors);
+      });
   }
 
   isPM(): boolean {
@@ -222,8 +248,6 @@ export class TimepickerComponent
       minutes: 'changeMinutes',
       seconds: 'changeSeconds'
     };
-
-    this.resetValidation();
 
     this._store.dispatch(
       (this as any)._timepickerActions[action[option]]({ step, source })
@@ -264,11 +288,6 @@ export class TimepickerComponent
   }
 
   _updateTime() {
-    if (this.timepickerGroup.invalid) {
-
-      return;
-    }
-
     this._store.dispatch(
       this._timepickerActions.setTime({
         hour: this.hours,
@@ -277,6 +296,13 @@ export class TimepickerComponent
         isPM: this.isPM()
       })
     );
+  }
+
+  onChange(timeOptionName: string, timeOptionValue: string) {
+    this._onChange({ timeOptionName, timeOptionValue, range: {
+      min: this.min,
+      max: this.max
+    } });
   }
 
   toggleMeridian(): void {
@@ -309,14 +335,14 @@ export class TimepickerComponent
    * Set the function to be called when the control receives a change event.
    */
   registerOnChange(fn: (_: any) => {}): void {
-    this.onChange = fn;
+    this._onChange = fn;
   }
 
   /**
    * Set the function to be called when the control receives a touch event.
    */
   registerOnTouched(fn: () => {}): void {
-    this.onTouched = fn;
+    this._onTouched = fn;
   }
 
   /**
@@ -327,12 +353,12 @@ export class TimepickerComponent
    */
   setDisabledState(isDisabled: boolean): void {
     if (isDisabled) {
-      this.timepickerGroup.disable();
+      this.ngControl.control.disable();
 
       return;
     }
 
-    this.timepickerGroup.enable();
+    this.ngControl.control.enable();
   }
 
   ngOnDestroy(): void {
